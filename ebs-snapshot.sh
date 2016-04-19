@@ -24,12 +24,19 @@ set -o pipefail
 # Make sure that you understand how the script works. No responsibility accepted in event of accidental data loss.
 #
 
+#Determinating AWS region
+
+region_var=${1:-}
+if [[ -z "$region_var" ]]
+then
+	echo "Using default AWS region from local config"
+	region=$(aws configure get region)
+else
+	region=$region_var
+fi
 
 ## Variable Declartions ##
 
-# Get Instance Details
-instance_id=$(wget -q -O- http://169.254.169.254/latest/meta-data/instance-id)
-region=$(wget -q -O- http://169.254.169.254/latest/meta-data/placement/availability-zone | sed -e 's/\([1-9]\).$/\1/g')
 
 # Set Logging Options
 logfile="/var/log/ebs-snapshot.log"
@@ -69,26 +76,33 @@ prerequisite_check() {
 
 # Function: Snapshot all volumes attached to this instance.
 snapshot_volumes() {
-	for volume_id in $volume_list; do
-		log "Volume ID is $volume_id"
+	for  instance_id in $ec2_list; do
+		# Grab all volume IDs attached to this instance
+		volume_list=$(aws ec2 describe-volumes --region $region --filters Name=attachment.instance-id,Values=$instance_id --query Volumes[].VolumeId --output text)
+		code_tag=$(aws ec2 describe-tags --region eu-central-1 --filters "Name=resource-id,Values=$instance_id" --output=text | grep -i "Code"  | cut -f5)
 
-		# Get the attched device name to add to the description so we can easily tell which volume this is.
-		device_name=$(aws ec2 describe-volumes --region $region --output=text --volume-ids $volume_id --query 'Volumes[0].{Devices:Attachments[0].Device}')
+		for volume_id in $volume_list; do
+			log "Volume ID is $volume_id"
 
-		# Take a snapshot of the current volume, and capture the resulting snapshot ID
-		snapshot_description="$(hostname)-$device_name-backup-$(date +%Y-%m-%d)"
+			# Get the attched device name to add to the description so we can easily tell which volume this is.
+			#device_name=$(aws ec2 describe-volumes --region $region --output=text --volume-ids $volume_id --query 'Volumes[0].{Devices:Attachments[0].Device}')
 
-		snapshot_id=$(aws ec2 create-snapshot --region $region --output=text --description $snapshot_description --volume-id $volume_id --query SnapshotId)
-		log "New snapshot is $snapshot_id"
+			# Take a snapshot of the current volume, and capture the resulting snapshot ID
+			snapshot_description="$code_tag-$(date +%Y-%m-%d)"
+
+			snapshot_id=$(aws ec2 create-snapshot --region $region --output=text --description $snapshot_description --volume-id $volume_id --query SnapshotId)
+			log "New snapshot is $snapshot_id"
 	 
-		# Add a "CreatedBy:AutomatedBackup" tag to the resulting snapshot.
-		# Why? Because we only want to purge snapshots taken by the script later, and not delete snapshots manually taken.
-		aws ec2 create-tags --region $region --resource $snapshot_id --tags Key=CreatedBy,Value=AutomatedBackup
+			# Add a "CreatedBy:AutomatedBackup" tag to the resulting snapshot.
+			# Why? Because we only want to purge snapshots taken by the script later, and not delete snapshots manually taken.
+			aws ec2 create-tags --region $region --resource $snapshot_id --tags Key=CreatedBy,Value=AutomatedBackup
+		done	
 	done
 }
 
 # Function: Cleanup all snapshots associated with this instance that are older than $retention_days
 cleanup_snapshots() {
+	volume_list=$(aws ec2 describe-volumes --region eu-central-1 --query Volumes[].VolumeId --output text)
 	for volume_id in $volume_list; do
 		snapshot_list=$(aws ec2 describe-snapshots --region $region --output=text --filters "Name=volume-id,Values=$volume_id" "Name=tag:CreatedBy,Values=AutomatedBackup" --query Snapshots[].SnapshotId)
 		for snapshot in $snapshot_list; do
@@ -114,8 +128,6 @@ cleanup_snapshots() {
 log_setup
 prerequisite_check
 
-# Grab all volume IDs attached to this instance
-volume_list=$(aws ec2 describe-volumes --region $region --filters Name=attachment.instance-id,Values=$instance_id --query Volumes[].VolumeId --output text)
-
+ec2_list=$(aws ec2 describe-instances --region eu-central-1 --filters "Name=tag:EBS-Snapshot,Values=1" --output=text --query 'Reservations[*].Instances[*].[InstanceId]')
 snapshot_volumes
 cleanup_snapshots
